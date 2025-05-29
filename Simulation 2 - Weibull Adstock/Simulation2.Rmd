@@ -1,0 +1,1001 @@
+---
+title: "MMM - Simulation"
+author: "Miguel Franco Pérez"
+date: "2024-12-16"
+output: html_document
+---
+
+# Pre-Settings
+```{r include=FALSE}
+# Load RStan
+library(rstan)
+library(tidyverse)
+library(bayesplot)
+library(patchwork)
+library(lubridate)
+library(ggplot2)
+library(reshape2)
+library(psych)
+library(gridExtra)
+options(mc.cores = parallel::detectCores()-1)
+
+#Stan model
+stan_file <- "4M_MesioMMM.stan"
+
+#Bitácora folder
+bitacora<-"C:/Users/usuari/Dropbox/1.Estudos/A. MASTER (MESIO)/2º Master - 2º Q/Z. TFM - Adsmurai/4. UPC Bayesian/TFM - Simulations/" #Folder to save the simulations
+
+##########################################
+#METHODS
+
+Geometric_Methods<- c(1:2)
+Weibull_Methods<- c(3)
+Poisson_Methods <- c(4)
+```
+
+# A. Simulation (Data-Generation)
+
+## A.1 Parameters for simulation
+```{r}
+set.seed(12345)
+
+M<-3      #M: cantidad de canales diferentes
+C<-1      #C: cantidad de controles diferentes
+
+Trend_Method <- 2
+                    #1: Years (all weeks within a year are equal)
+                    #2: Weeks (each week is different across trend)
+
+start_date<-"2000-01-07" #fecha de inicio
+años<- 4  #años: cantidad de años para la simulación
+end_date<- as.Date(start_date) %m+% years(años)
+
+L<-3      #L: cantidad de lags máximos
+
+#############################################################################
+date_seq <- seq.Date(from = as.Date(start_date)-(L*7), to=as.Date(end_date), by = "7 days")
+Semanas.Efect<-length(date_seq)-L     #T: cantidad de observaciones temporales (unidad temporal base)
+#############################################################################
+
+
+M_sim<-1  #M_sim: number of simulations obtained
+Adstock_Method<-3                  
+                  #1 - Geometric Non-Weighted
+                  #2 - Geometric Weighted
+
+                  #3 - Weibull PDF 
+
+                  #4 - Poisson PDF
+
+#//-----------------------------------
+#// X MATRIX - Matriz de Gasto (spend)
+#//-----------------------------------
+
+#Spends en cada medio Xi (Dimension [T+L,M]) [Matrix]
+
+x<-as.array(cbind(
+  c(abs(rnorm(n=Semanas.Efect+L, mean=750, sd=550))), #X1
+  c(abs(rnorm(n=Semanas.Efect+L, mean=500, sd=350))), #X2
+  c(abs(rnorm(n=Semanas.Efect+L, mean=250, sd=1000)))  #X3
+  ))
+
+colnames(x) <- paste0("x", 1:M)
+rownames(x) <- 1:nrow(x)
+
+#//-----------------------------------
+#// C MATRIX - Matriz de variables control
+#//-----------------------------------
+
+#Valores en cada variable control Ci (Dimension [T+L,C]) [Matrix]
+
+C_used<-C
+ct<-as.array(cbind(
+  c(runif(n=Semanas.Efect+L, min=0, max=1000))  #C1
+  ))
+
+colnames(ct) <- paste0("ct", 1:C)
+rownames(ct) <- 1:nrow(ct)
+
+#//-----------------------------------
+#// VENTAS ESTACIONALES
+#//-----------------------------------
+
+ventas_psi<-c(rep(500,3), rep(4500,2),  rep(7500,3), rep(5200,2), rep(200,2)) #Ventas estacionales
+
+psi<-ventas_psi-mean(ventas_psi)
+
+#//-----------------------------------
+#// PARAMETERS
+#//-----------------------------------
+params_list<-list(
+       beta_0 = 7000,      #Basal sells
+       sigma_e = 3500,      #Noise around the data
+       
+       tau=125,      #DEFINE CONSIDERING Trend_Method!
+       
+       psi=psi,
+       
+       # The parameters from adstock methods non-used must be defined even if later ignored
+       theta_x = array(c(0.20, 0.3, 0.1)), #Bigger more adstocked produced [0,1]
+       
+       shape_x = array(c(1, 1.5, 2)), 
+       
+       scale_x = array(c(0.75, 1, 0.5)),
+       
+       lambda_x = array(c(0.75, 1.5, 2)),
+       
+       beta_x = array(c(15000, 3000, 5000)), #Bigger more ceiling upon saturation
+       gamma_x = array(c(2000, 500, 800)), #Bigger later saturation (Based on Geometric or Weighted Geometric                             depending on the Adstock Method selected)
+       alpha_x= array(c(2.5, 1.5, 2)),      #Bigger more S shape
+       
+       beta_ct = array(c(15))
+       )
+```
+
+```{r}
+#TEMPORAL TRANSFORMATIONS
+t_ind<-seq_along(date_seq)-(L+1)
+t_ind<-t_ind[-(1:L)]
+ano <- year(date_seq)
+mes <- month(date_seq)
+semana_ano <- isoweek(date_seq)
+
+week_of_month <- function(date) {
+  first_day <- floor_date(date, "month")
+  return(ceiling((day(date) + wday(first_day) - 1) / 7))
+}
+
+semana_mes <- sapply(date_seq, week_of_month)
+
+year_marks<- c(FALSE, diff(lubridate::year(date_seq)) != 0)
+```
+
+
+```{r}
+#DIMENSIONAL ERROR COMPROBATIONS
+
+for(param in c("theta_x", "shape_x", "scale_x","lambda_x","beta_x", "gamma_x", "alpha_x")){
+  if( length(params_list[[param]])!=M ){
+    stop(paste(param, "dimensions bad defined! \n Declared M =",M, "\n length(", param, ") =", length(params_list$param)))}
+}
+
+ if( ncol(x)!=M ){
+    stop(paste("X", "dimensions bad defined! \n Media dimension not correctly declared \n------------------------ \n Declared ( M ) =",M, "\n ncol(", "X", ") =", ncol(x)))
+ }
+
+ if( nrow(x)!=Semanas.Efect+L ){
+    stop(paste("X", "dimensions bad defined! \n Time dimension not correctly declared \n ------------------------ \n Declared ( T+L ) =",T+L, "\n nrow(", "X", ") =", nrow(x)))
+ }
+
+if (C>0){
+ if( nrow(ct)!=Semanas.Efect+L ){
+    stop(paste("C", "dimensions bad defined! \n Time dimension not correctly declared \n ------------------------ \n Declared ( T+L ) =",T+L, "\n nrow(", "ct", ") =", nrow(ct)))
+ }
+
+ if( ncol(ct)!=C ){
+    stop(paste("C", "dimensions bad defined! \n Media dimension not correctly declared \n------------------------ \n Declared ( C ) =",C, "\n ncol(", "ct", ") =", ncol(ct)))
+ }
+}
+```
+
+
+### Plotting Pre-Simulation
+
+```{r}
+###############################################################################
+#Plotting
+#############################################################################
+
+x_dark_colors <- c("x1" = "#f9380e", "x2" = "#0c810b", "x3" = "#1480df")
+x_light_colors <- c("x1" = "#f7a290", "x2" = "#b8f3b7", "x3" = "#89bae5")
+
+ct_dark_colors <- c("ct1" = "#bd07af")
+ct_light_colors <- c("ct1" = "#e1b6de")
+
+# TEMPORAL PLOTS
+#######################################
+  par(mfrow=c(4,1), mar=c(2, 4, 1, 2))
+  
+  trend<-if(Trend_Method==1){ano*params_list$tau}else{t_ind*params_list$tau}
+  seasonal<-params_list$psi[mes][-(1:L)]
+  Temporal<-trend+seasonal+params_list$beta_0
+  
+  YLIM<-c(min(params_list$beta_0, trend, seasonal, Temporal),
+          max(params_list$beta_0, trend, seasonal, Temporal))
+  
+  plot(x=t_ind, y=rep(params_list$beta_0, length(t_ind)),  type="l", col="darkblue", lwd= 2, xlab="", ylab="Basal t0", main="Temporal Effects")
+  abline(v=t_ind[year_marks], col="gray", lty=2)
+  
+  plot(x=t_ind, y=trend,  type="l", col="blue", lwd= 2, xlab="",)
+  abline(v=t_ind[year_marks], col="gray", lty=2)
+  
+  plot(x=t_ind, y=seasonal,  type="l", col="purple", lwd= 2, xlab="")
+  abline(v=t_ind[year_marks], col="gray", lty=2)
+  abline(h=0, col="gray", lwd= 2, lty=2)
+  
+    par(mar=c(4, 4, 1, 2))
+  
+  plot(x=t_ind, y=Temporal,  type="l", col="darkblue", lwd= 3, xlab="t")
+  abline(v=t_ind[year_marks], col="gray", lty=2)
+
+
+# COVARIATES PLOT
+#######################################
+
+par(mfrow=c(M+C,1), mar=c(2, 4, 1, 2))
+
+for (i in 1:M){
+plot(x=t_ind, y=x[-(1:L),i],  type="l", col= x_dark_colors[i], lwd= 1, xlab="", ylim=c(0,max(rowSums(x)[-(1:L)], rowSums(ct)[-(1:L)])), ylab=paste0("Channel ",i, " Spend"), main=paste0("x",i), cex.main=1)
+abline(v=t_ind[year_marks], col="gray", lty=2)
+}
+
+  par(mar=c(4, 4, 1, 2))
+for (i in 1:C){
+plot(x=t_ind, y=ct[-(1:L),i],  type="l", col= ct_dark_colors[i], lwd= 2, xlab="t", ylim=c(0,max(rowSums(x)[-(1:L)], rowSums(ct)[-(1:L)])), ylab=paste0("Control ",i), main=paste0("c",i), , cex.main=1)
+abline(v=t_ind[year_marks], col="gray", lty=2)
+}
+
+
+# SPEND SUMMARY
+#######################################
+summary(x)
+
+# SPEND SHARE
+#######################################
+
+df <- as.data.frame(x)
+df$Semana <- rownames(df)
+
+df_long <- pivot_longer(df, cols = colnames(x), names_to = "Medio", values_to = "Gasto")
+
+g1 <- ggplot(df_long, aes(x = Semana, y = Gasto, fill = Medio)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = x_dark_colors)+
+  labs(title = "Advertising Spend Share",
+       x = "Semana",
+       y = "Gasto total",
+       fill = "Medio") +
+  theme_minimal()
+
+df_total <- df_long %>%
+  group_by(Medio) %>%
+  summarise(GastoTotal = sum(Gasto))
+
+g2 <- ggplot(df_total, aes(x = GastoTotal, y = "", fill = Medio)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = paste0(Medio,"\n",scales::percent(GastoTotal / sum(GastoTotal), accuracy = 0.1))), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", size = 5) +
+  labs(title = "Accumulated Advertising Spend",
+       x = "Gasto total acumulado",
+       y = NULL,
+       fill = "Medio") +
+  scale_fill_manual(values = x_dark_colors)+
+  theme_minimal() +
+  coord_flip()
+
+g1 + g2 + plot_layout(ncol = 2)
+
+# DECAY CURVES
+#######################################
+t_rang<-seq(0,L,0.125) # Rango para funciones continuas
+d_rang<-seq(0,L,1)              # Rango para funciones discretas
+
+# FUNCTIONS
+GeomDecay<- function(t, theta){
+    theta^t
+}
+
+s_mode_weibull <- function(shape, scale) {
+  ifelse(shape > 1, (scale * ((shape - 1) / shape)^(1 / shape)), 0.001)
+         # Mode is undefined for shape <= 1
+  }
+
+WeibullDecay<- function(t, shape, scale){
+    dweibull(x=t, shape=shape, scale=scale)/dweibull(x=s_mode_weibull(shape,scale), shape=shape, scale=scale)
+  
+}
+
+PoissonDecay <- function(t, lambda){
+    dpois(x=t, lambda = lambda)
+}
+
+#COMPUTING & PLOTTING
+
+par(mfrow=c(2,M), mar=c(8,2,2,2))
+
+for(m in 1:M){
+  
+if(Adstock_Method %in% Geometric_Methods){
+  
+    rang<-t_rang
+    Decay<-GeomDecay(t=rang,theta=params_list$theta_x[m])
+    params_legend<-paste0("\n\n θ[",m,"] =",params_list$theta_x[m])
+  
+  }else  if(Adstock_Method %in% Weibull_Methods){
+    
+    rang<-t_rang
+    Decay<- WeibullDecay(t=rang,shape=params_list$shape_x[m],scale=params_list$scale_x[m])
+    params_legend<-paste0("\n\n shape[",m,"] = ",params_list$shape_x[m],
+                          "\n scale[",m,"] = ",params_list$scale_x[m])
+    
+  }else  if(Adstock_Method %in% Poisson_Methods){
+    
+    rang<-d_rang
+    Decay<-PoissonDecay(t=rang,lambda=params_list$lambda_x[m])
+    
+  }
+  
+plot(x=rang, 
+     y=Decay,
+     type="l",
+     lty=3,
+     main=paste0("Media x[",m,"] Decay"),
+     ylab="w_s lag weight",
+     xlab="Lag s",
+     ylim=c(0,1),
+     lwd=1.25,
+     col = x_dark_colors[m])
+
+title(sub = params_legend, line = 6)
+
+points(x = rang[which(rang %% 1 == 0)],
+       y = Decay[which(rang %% 1 == 0)],
+       type = "p",
+       pch = 16,  
+       cex=1.5,
+       col = x_dark_colors[m])
+
+abline(h=0)
+abline(h=1, col="darkgrey") 
+abline(v=seq(1,max(rang),1), col="lightgrey", lty=2)  
+}
+
+
+
+# SATURATION CURVES
+#######################################
+x_rang<-seq(0,max(x),max(x)*0.01)
+Hill<- function(x, alpha, gamma, beta=1){
+    beta*1/(1+ (gamma/x)^alpha)
+}
+
+par(mfrow=c(1,M),mar = c(8, 5, 5, 2))  # Increase the bottom margin (first value)
+
+for (i in 1:M){
+y_rang<-Hill(x=x_rang, beta=params_list$beta_x[i], alpha=params_list$alpha_x[i], gamma = params_list$gamma_x[i])
+
+plot(x=x_rang, y = y_rang, type = "l", main = paste0("Saturation Hill function \n", "Channel x[", i,"]"), xlab=paste0("adstock( x[", i, "] )\n"), ylab="Revenue", xlim=c(0, max(x_rang)), col=x_dark_colors[i], ylim=c(0,max(params_list$beta_x*1.05)), lwd=3)
+abline(a = 0, b = 1, col = "red", lwd = 2)
+x_fill <- seq(par("usr")[1], par("usr")[2], length.out = 100)
+y_fill <- x_fill  # Como y = x
+polygon(c(x_fill, rev(x_fill)), c(y_fill, rep(par("usr")[3], length(y_fill))),
+        col = rgb(0.6, 0.2, 0.1, 0.5), border = NA)
+
+abline(h=params_list$beta_x[i], col="darkgrey")
+title(sub = paste0("α[", i, "] = ", params_list$alpha_x[i], 
+                   " \n ɣ[",i,"] = ", params_list$gamma_x[i],
+                    " \n β[",i,"] = ", params_list$beta_x[i]), line = 6)
+}
+legend("topright", legend="Negative ROI (spend > Revenue)",  fill = rgb(0.6, 0.2, 0.1, 0.5),
+       border = "red", cex=0.75, xpd=NA)
+
+```
+
+
+## A.2 Simulation
+
+```{r}
+#SIMULATION
+t_ind <- seq_len(Semanas.Efect+L)
+
+kmax<- 12
+
+sim_data <- list(
+  Adstock_Method=Adstock_Method,
+  Trend_Method=Trend_Method,
+  T = Semanas.Efect+L, 
+  L=L,
+  M=M,
+  C=ifelse(C>0,C,0),
+  C_used=C_used,
+  M_sim=M_sim,
+  
+  is_test=c(rep(0, Semanas.Efect+L-1),1),
+  
+  t_ind = t_ind,
+  semana_ano = semana_ano,
+  semana_mes = semana_mes,
+  mes = mes,
+  ano = ano,
+  
+  Y = rep(33226.12, Semanas.Efect+L), # Dummy data; will not affect simulation
+  
+  x = as.array(x),
+  ct = as.array(ct),
+  
+ beta_0_shape= 2,
+beta_0_scale= 4290.32,
+sigma_e_shape= 1,
+sigma_e_scale= 2619.759,
+tau_mean=0,
+tau_sigma= 17127.88,
+sigma_psi_mean= 2450.186,
+sigma_psi_sigma= 1225.093,
+theta_x_a=array(rep(6,M)),
+theta_x_b=array(rep(10,M)),
+shape_x_shape=array(rep(1,M)),
+shape_x_scale=array(rep(0.75,M)),
+scale_x_shape=array(rep(1,M)),
+scale_x_scale=array(rep(3,M)),
+lambda_x_min=array(rep(0,M)),
+lambda_x_max=array(rep(L,M)),
+beta_x_shape=array(rep(1,M)),
+beta_x_scale=array(rep(13918.49,M)), 
+gamma_x_shape=array(rep(2,M)),
+gamma_x_scale=array(rep(13264.101),M), 
+alpha_x_shape=array(rep(2,M)),
+alpha_x_scale=array(rep(5,M)),
+beta_ct_mu=array(rep(2,C)),
+beta_ct_sigma=array(16.54088)
+)
+
+# Define fixed parameter values for simulation
+init_params <- function() {
+  return (params_list)
+}
+
+# Run the model with zero iterations for simulation
+fit <- sampling(
+  stan_model(file = stan_file),
+  data = sim_data,
+  init = init_params,
+  iter = 1,       # One iteration
+  chains = 1,     # Single chain
+  warmup=0,
+  algorithm = "Fixed_param", # Use fixed parameters for simulation
+  verbose=FALSE,
+  seed=12345
+)
+
+# Extract simulated data
+stan_fit<-rstan::extract(fit)
+
+simulated_data <- as.matrix(stan_fit$y_sim[,,])
+
+# View the simulated data
+head(simulated_data,10); cat("        ...")
+#stan_fit
+```
+
+## A.3 Simulation controller
+```{r}
+y_sim<-as.data.frame(simulated_data)
+colnames(y_sim)<-paste("y_sim[",seq(1,M_sim),"]",sep = "")
+
+# X Matrix
+X<-sim_data$x
+colnames(X) <- paste0("x[", seq_len(ncol(X)), "]")
+
+# ADSTOCK WEIGHTED
+w_x_den<-c()
+w_x<-c()
+gamma_w_x<-c()
+gamma_non_w_x<-c()
+
+for(m in 1:M){
+      w_x_den[m]=0;                     #Valor de inicialización
+        for (s in 0:L){
+          w_x_den[m] = w_x_den[m] + params_list$theta_x[m]^s;    
+          #Para cada lag s, va sumando el efecto
+        }
+      w_x[m] = 1 / w_x_den[m];
+      
+      if(Adstock_Method==1){
+          gamma_non_w_x[m]<-params_list$gamma_x[m]
+          gamma_w_x[m]<-params_list$gamma_x[m] * w_x[m]
+      }
+      
+      if(Adstock_Method!=1){
+          gamma_non_w_x[m]<-params_list$gamma_x[m] / w_x[m]
+          gamma_w_x[m]<-params_list$gamma_x[m]
+      }
+}
+
+# ADSTOCK COMPUTATION PHASES
+XX<-list()
+XXX<-NA
+
+for (m in 1:M){
+  XX[[m]] <- cbind(
+    c(NA),
+    X[,m],
+    c(stan_fit$x_pre_ads[,,m]),
+    c(stan_fit$x_ads[,,m]),
+    c(stan_fit$x_sat[,,m]),  
+    c(stan_fit$x_hilladstocked[,,m]),
+    c(NA),         #We take them from param_list as they are Parameters fixed on the Generated Quantities
+    c(params_list$beta_x[m]),
+    if (Adstock_Method %in% Geometric_Methods){c(params_list$theta_x[m])}else{c(0.001)},
+    if (Adstock_Method %in% Weibull_Methods){c(params_list$shape_x[m])}else{c(0.001)},
+    if (Adstock_Method %in% Weibull_Methods){c(params_list$scale_x[m])}else{c(0.001)},
+    if (Adstock_Method %in% Poisson_Methods){c(params_list$lambda_x[m])}else{c(0.001)},
+    c(gamma_w_x[m]),
+    #c(gamma_non_w_x[m]), 
+    c(params_list$alpha_x[m]),
+    c(w_x[m]),
+    c(sum(stan_fit$x_hilladstocked[,,m])/sum(X[,m])), #ROI_x[i]
+    c(sum(stan_fit$x_hilladstocked[,,m])/sum(stan_fit$Y_marketing)), #RE_advertising_x[i]
+    c(sum(stan_fit$x_hilladstocked[,,m])/sum(stan_fit$Y_signal)) #RE_Signal_x[i]
+  )
+
+  colnames<-c(
+    paste0("Channel[",m,"]"),
+    paste0("x[", m, "]"),
+    paste0("x_pre_ads[", m, "]"),
+    paste0("x_ads[", m, "]"),
+    paste0("x_sat[", m, "]"),     
+    paste0("x_hilladstocked[", m, "]"),
+    paste0("Params_Channel[",m,"]"),
+    paste0("beta_x[", m, "]"),
+    paste0("theta_x[", m, "]"),
+    paste0("shape_x[", m, "]"),
+    paste0("scale_x[", m, "]"),
+    paste0("lambda_x[", m, "]"),
+    paste0("gamma_w_x[", m, "]"),
+    #paste0("gamma_non_w_x[", m, "]"),
+    paste0("alpha_x[", m, "]"),
+    paste0("w_x[", m, "]"),
+    paste0("ROI_x[", m, "]"),
+    paste0("RE_advertising_x[", m, "]"),
+    paste0("RE_Signal_x[", m, "]")
+  )
+  
+  colnames(XX[[m]])<-colnames
+  
+  XXX<-cbind(XXX,XX[[m]])
+}
+
+#SEASONAL EFFECTS
+PSI<-data.frame(NA)
+counter<-0
+
+for (psi in params_list$psi) {
+  counter<-counter+1
+  PSI[1:(Semanas.Efect+L),counter]<-psi
+  
+  colnames(PSI)[counter]<-paste0("psi[",counter,"]")
+}
+
+#CONTROL EFFECTS
+
+  CT<-sim_data$ct
+  colnames(CT) <- paste0("ct[", seq_len(ncol(CT)), "]")
+  
+  CC<-list()
+  CCC<-NA
+  
+  for (c in 1:sim_data$C_used){
+    CC[[c]] <- cbind(
+      c(NA),
+      sim_data$ct[,c],
+      c(stan_fit$ct_impact[,,c]),
+      c(NA),         #We take them from param_list as they are Parameters fixed on the Generated Quantities
+      c(params_list$beta_ct[c]),
+      c(sum(stan_fit$ct_impact[,,c])/sum(stan_fit$Y_signal)) #RE_Signal_ct[i]
+    )
+  
+    colnames(CC[[c]])<-c(
+      paste0("Control[",c,"]"),
+      paste0("ct[",c,"]"),
+      paste0("ct_impact[", c, "]"),
+      paste0("params_Control[",c,"]"),
+      paste0("beta_ct[", c, "]"),
+      paste0("RE_Signal_ct[", c, "]")
+    )
+    
+    CCC<-cbind(CCC,CC[[c]])
+  }
+
+
+# FINAL SUMMARY TABLE
+simulation<-cbind(
+             t_ind = t_ind,
+             semana_ano = semana_ano,
+             semana_mes = semana_mes,
+             mes = mes,
+             ano = ano,
+             Data=NA,
+             y_sim, #We take them from stan_fit, they are Generated Quantities
+             Y_signal=c(stan_fit$Y_signal),
+             X,
+             CT,
+             General_Params=NA,
+             beta_0=params_list$beta_0,
+             sigma_e=params_list$sigma_e,
+             M=M,
+             C=C,
+             C_used=C_used,
+             Generation_Adstock_Method = Adstock_Method,
+        #Temporal Effects
+            TEMPORAL=NA,
+            Y_temporal=c(stan_fit$Y_temporal),
+            RE_Signal_Y_temporal=c(sum(stan_fit$Y_temporal)/sum(stan_fit$Y_signal)),
+            RE_Signal_basalTrend=c((Semanas.Efect+L)*params_list$beta_0/sum(stan_fit$Y_signal)),
+            trend=c(stan_fit$trend),
+            RE_Temporal_trend=c(sum(stan_fit$trend)/sum(stan_fit$Y_temporal)),
+            seasonal=c(stan_fit$seasonal),
+            Temporal_Params=NA,
+            Trend_Method=Trend_Method,
+            tau=stan_fit$tau,
+            sigma_psi=sd(params_list$psi)*(length(params_list$psi)-1)/length(params_list$psi), #Anulando la corrección muestral de n-1
+            PSI,
+        #Channel Specific
+            MARKETING=NA,
+            Y_Marketing=c(stan_fit$Y_marketing),
+            RE_Signal_Y_Marketing=c(sum(stan_fit$Y_marketing)/sum(stan_fit$Y_signal)),
+             XXX[,-1],
+        #Control Variables
+            CONTROL=NA,
+            Y_Control=c(stan_fit$Y_control),
+            RE_Signal_Y_Control=c(sum(stan_fit$Y_control)/sum(stan_fit$Y_signal)),
+            CCC[,-1],
+            fake_date=date_seq
+            )
+             
+
+#The parameter's estimations come from the posterior estimates for the Y dummie model. NOT FOR OUR SIMULATION!So we won't look at them.
+
+rownames(simulation)<-paste("t=",seq(-L,nrow(simulation)-L-1))
+
+View(simulation)
+```
+
+
+### Plotting Post-Simulation
+
+```{r}
+# DESCRIPTIVE
+###############
+df<-simulation[-c(1:3),c(7,9:12)]
+descr<-as.data.frame(describe(df, quant=c(0.25,0.75), IQR=TRUE)[,-c(1)])
+round(t(descr),2)
+
+# DENSITY + HISTOGRAMS
+########################
+df<-data.frame(Y=simulated_data,x,ct)
+numeric_data <- df[sapply(df, is.numeric)]
+
+group_y <- "Y"
+group_x <- apply(expand.grid(c("x"), seq(1:M)), 1, function(x) paste0(x[1], x[2]))
+group_ct <- apply(expand.grid(c("ct"), seq(1:C_used)), 1, function(x) paste0(x[1], x[2]))
+
+ncol_common <- max(length(group_x), length(group_ct))
+
+long_y <- melt(df[, group_y, drop = FALSE], id.vars = NULL)
+long_x <- melt(df[, group_x, drop = FALSE], id.vars = NULL)
+long_ct <- melt(df[, group_ct, drop = FALSE], id.vars = NULL)
+
+py <- ggplot(long_y, aes(x = value)) +
+  geom_histogram(aes(y = ..density..), fill = "gray80", color = "black", bins = 30) +
+  geom_density(color = "black", size = 1.2) +
+  labs(title = "Revenue", x = "Revenue (u.m.)", y = "Density") +
+  theme_minimal()
+
+# X variables
+px <- ggplot(long_x, aes(x = value)) +
+  geom_histogram(aes(y = ..density.., fill = variable), color = "black", bins = 30) +
+  geom_density(aes(color = variable), size = 1.1) +
+  scale_fill_manual(values = x_light_colors) +
+  scale_color_manual(values = x_dark_colors) +
+  facet_wrap(~ variable, scales = "free", ncol = ncol_common) +
+  labs(title = "Advertising Spend", x = "Spend (u.m.)", y = "Density") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Ct variables
+
+pct <- ggplot(long_ct, aes(x = value)) +
+  geom_histogram(aes(y = ..density.., fill = variable), color = "black", bins = 30) +
+  geom_density(aes(color = variable), size = 1.1) +
+  scale_fill_manual(values = ct_light_colors) +
+  scale_color_manual(values = ct_dark_colors) +
+  facet_wrap(~ variable, scales = "free", ncol = ncol_common) +
+  labs(title = "Control Variables", x = "Value", y = "Density") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+(py | pct) / px
+
+# CORRELATION
+##################
+cp<-list()
+
+df2<-data.frame(df,
+                t=simulation$t_ind,
+                mes=simulation$mes)
+
+counter<-0
+for(method in c("pearson", "spearman", "kendall")){
+counter<-counter+1
+
+cor_matrix <- cor(df2, method=method)
+var_names<-colnames(df2)
+cor_melted <- melt(cor_matrix)
+cor_melted$Var1 <- factor(cor_melted$Var1, levels = rev(var_names))  # y-axis
+cor_melted$Var2 <- factor(cor_melted$Var2, levels = var_names)  # x-axis
+
+cp[[counter]]<-ggplot(cor_melted, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 1)), size = 1.75, color = "black") +
+  scale_fill_gradient2(
+    low = "blue", high = "red", mid = "white",
+    midpoint = 0, limit = c(-1, 1), space = "Lab",
+    name=NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    panel.grid.major = element_blank(),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 6),   # Tamaño del texto en la barra
+    legend.key.height = unit(0.3, "cm"),    # Altura de los bloques de la barra
+    legend.key.width = unit(0.3, "cm")
+  ) +
+  coord_fixed() +
+  labs(title = paste0("Correlation (", method,")"), x = "", y = "", size = 0.6)
+}
+ cp[[1]]|cp[[2]]|cp[[3]]
+
+# AUTOCORRELATION
+par(mfrow=c(5,2),mar=c(2,4,1,2))
+
+for (var in colnames(df)){
+  acf(df[,var], main="", ylim=c(-1,1)); title(main =var, line = 0.3, cex.main=0.9)
+  pacf(df[,var], ylab="PACF", ylim=c(-1,1), main=""); title(main =var, line = 0.3, cex.main=0.9)
+}
+
+
+t_ind <- seq_len(Semanas.Efect+L)-(L+1)
+
+#X vs. HILLADSTOCK
+#################
+par(mfrow=c(M+1,1), mar=c(2, 4, 1, 15))
+
+plot(x=t_ind[-(1:L)], y=stan_fit$Y_marketing[-(1:L)],  type="l", col="darkgreen", lwd= 3, xlab="", ylim=c(0,max(x, stan_fit$Y_marketing[-(1:L)])), ylab=paste0("Aggregated"), main="Advertising Effects")
+abline(v=t_ind[year_marks], col="gray", lty=2)
+
+for (i in 1:M){
+lines(x=t_ind[-(1:L)], y=stan_fit$x_hilladstocked[,,i][-(1:L)], type = "l", col=i+1, lwd= 2)
+}
+
+  legend("topright",
+         inset = c(-0.3, 0),  # mover hacia afuera (derecha)
+         legend = "Advertising Revenue \n Σ hilladstock ( x[m] )",
+         col = "darkgreen",
+         lwd = 3,
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+
+for (i in 1:M){
+plot(x=t_ind[-(1:L)], y=c(simulated_data[-(1:L)]),  type="l", col=NA, lwd= 3, xlab="", ylim=c(0,max(stan_fit$ct_impact[,,][-(1:L)], stan_fit$x_hilladstocked[,,][-(1:L)])), ylab=paste0("Channel ",i))
+abline(v=t_ind[year_marks], col="gray", lty=2)
+
+lines(x=t_ind[-(1:L)], y =x[-(1:L),i], type = "l", col=i+1, lwd= 1.5, lty=2)
+
+lines(x=t_ind[-(1:L)], y=stan_fit$x_hilladstocked[,,i][-(1:L)], type = "l", col=i+1, lwd= 2)
+
+  legend("right",
+         inset = c(-0.4, 0),  # mover hacia afuera (derecha)
+         legend = c(paste0("Revenue attributed to Channel", i,"\n hilladstock ( x[",i,"] )"), paste0("Spend on Channel", i,"\n x[",i,"]") ),
+         col = c(i+1, i+1), 
+         lwd = c(2.3, 1),
+         lty=c(1,2),
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+
+}
+
+  #LOG-SCALE
+  par(mfrow=c(M+1,1), mar=c(2, 4, 1, 18))
+  
+for (i in 1:M){
+plot(x=t_ind[-(1:L)], y=c(simulated_data[-(1:L)]),  type="l", col=NA, lwd= 3, xlab="", ylim=c(0,max(log(stan_fit$ct_impact[,,][-(1:L)]), log(stan_fit$x_hilladstocked[,,][-(1:L)]))), ylab=paste0("Channel ",i))
+abline(v=t_ind[year_marks], col="gray", lty=2)
+
+lines(x=t_ind[-(1:L)], y =log(x[-(1:L),i]), type = "l", col=x_light_colors[i], lwd= 1.5)
+
+lines(x=t_ind[-(1:L)], y=log(stan_fit$x_hilladstocked[,,i][-(1:L)]), type = "l", col=x_dark_colors[i], lwd= 2)
+
+  legend("right",
+         inset = c(-0.5, 0),  # mover hacia afuera (derecha)
+         legend = c(paste0("Log-Revenue attributed to Channel", i), paste0("Log-Spend on Channel", i) ),
+         col = c(i+1, i+1), 
+         lwd = c(2.3, 1),
+         lty=c(1,2),
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+
+}
+
+#C 
+#################
+if(C>0){
+par(mfrow=c(M+1,1), mar=c(2, 4, 1, 18))
+  
+  for (i in 1:C){
+  plot(x=t_ind[-(1:L)], y=c(simulated_data[-(1:L)]),  type="l", col=NA, lwd= 3, xlab="", ylim=c(0,max(stan_fit$ct_impact[,,][-(1:L)], stan_fit$x_hilladstocked[,,][-(1:L)])), ylab=paste0("Control ",i), main="Control Variables")
+  abline(v=seq(48, length(t_ind[-(1:L)]), by=48), col="gray", lty=2)
+  
+  lines(x=t_ind[-(1:L)], y =ct[-(1:L),i], type = "l", col=ct_light_colors[i], lwd= 1.5, lty=2)
+  
+  lines(x=t_ind[-(1:L)], y=stan_fit$ct_impact[,,i][-(1:L)], type = "l", col=ct_dark_colors[i], lwd= 2)
+  }
+}
+
+legend("right",
+         inset = c(-0.44, 0),  # mover hacia afuera (derecha)
+         legend = c(paste0("Revenue attributed to Control", i), paste0("Value of Control", i,"\n c[",i,"]") ),
+         col = c("pink", i+5), 
+         lwd = c(2.3, 1),
+         lty=c(1,2),
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+
+# LOG-SCALE
+par(mar=c(4, 4, 1, 18))
+if(C>0){
+  
+  for (i in 1:C){
+  plot(x=t_ind[-(1:L)], y=c(simulated_data[-(1:L)]),  type="l", col=NA, lwd= 3, xlab="t", ylim=c(0,max(log(stan_fit$ct_impact[,,][-(1:L)]), log(stan_fit$x_hilladstocked[,,][-(1:L)]))), ylab=paste0("Control ",i))
+  abline(v=seq(48, length(t_ind[-(1:L)]), by=48), col="gray", lty=2)
+  
+  lines(x=t_ind[-(1:L)], y=log(ct[-(1:L),i]), type = "l", col=ct_light_colors[i], lwd= 1.5)
+  
+  lines(x=t_ind[-(1:L)], y=log(stan_fit$ct_impact[,,i][-(1:L)]), type = "l", col=ct_dark_colors[i], lwd= 2)
+  }
+}
+
+legend("right",
+         inset = c(-0.5, 0),  # mover hacia afuera (derecha)
+         legend = c(paste0("Log-Revenue attributed to Control", i), paste0("Log-Value of Control", i,"\n c[",i,"]") ),
+         col = c("pink", i+5), 
+         lwd = c(2.3, 1),
+         lty=c(1,2),
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+
+# SATURATION CURVES
+#######################################
+x_rang<-seq(0,max(stan_fit$x_hilladstocked[,,][-(1:L)]),max(x)*0.01)
+Hill<- function(x, alpha, gamma, beta=1){
+    beta*1/(1+ (gamma/x)^alpha)
+}
+
+par(mfrow=c(1,M),mar = c(8, 5, 5, 2))  # Increase the bottom margin (first value)
+
+for (i in 1:M){
+y_rang<-Hill(x=x_rang, beta=params_list$beta_x[i], alpha=params_list$alpha_x[i], gamma = params_list$gamma_x[i])
+
+plot(x=x_rang, y = y_rang, type = "l", main = paste0("Saturation Hill function \n", "Channel x[", i,"]"), xlab=paste0("adstock( x[", i, "] )"), ylab="Revenue", xlim=c(0, max(x_rang)), ylim=c(0,max(params_list$beta_x*1.2)), lwd=3, col=x_dark_colors[i])
+abline(a = 0, b = 1, col = "brown", lwd = 2)
+x_fill <- seq(par("usr")[1], par("usr")[2], length.out = 100)
+y_fill <- x_fill  # Como y = x
+polygon(c(x_fill, rev(x_fill)), c(y_fill, rep(par("usr")[3], length(y_fill))),
+        col = rgb(0.6, 0.2, 0.1, 0.5), border = NA)
+
+abline(h=params_list$beta_x[i], col="darkgrey")
+rect(min(stan_fit$x_hilladstocked[,,i][-(1:L)]), par("usr")[3], max(stan_fit$x_hilladstocked[,,i][-(1:L)]), par("usr")[4], col = rgb(0, 0, 1, 0.15), border = NA)
+rect(quantile(stan_fit$x_hilladstocked[,,i][-(1:L)],probs=0.25), par("usr")[3], quantile(stan_fit$x_hilladstocked[,,i][-(1:L)],probs=0.75), par("usr")[4], col = rgb(0, 0, 1, 0.2), border = NA)
+title(sub = paste0("α[", i, "] = ", params_list$alpha_x[i], 
+                   " \n ɣ[",i,"] = ", params_list$gamma_x[i],
+                    " \n β[",i,"] = ", params_list$beta_x[i]), line = 6)
+}
+
+legend("topright", 
+       legend=c("Negative ROI (Spend > Revenue)","IQR x","Range x"),  
+       fill = c(rgb(0.6, 0.2, 0.1, 0.5),rgb(0, 0, 1, 0.2+0.15),rgb(0, 0, 1, 0.15)),
+       border = c("red",NA,NA), 
+       cex=0.75, xpd=NA)
+
+#KPI DESGLOSADO
+#################
+
+par(mfrow=c(3,1), mar=c(4, 4, 1, 12))
+
+# KPI + Y_signal
+plot(x=t_ind[-(1:L)], y=stan_fit$Y_signal[-(1:L)],  type="l", col="black", lwd= 3, xlab="", ylim=c(0,max(x, simulated_data)), ylab="KPI + Y_signal")
+
+abline(v=t_ind[year_marks], col="gray", lty=2)
+
+lines(x=t_ind[-(1:L)], y=c(simulated_data[-(1:L)]),  type="l", col="red", lwd= 2)
+
+legend("right",
+         inset = c(-0.27, 0),  # mover hacia afuera (derecha)
+         legend = c("Observed revenue \n Y", "Signal" ),
+         col = c("red", "black"), 
+         lwd = 2,
+         lty=1,
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+
+# KPI + Second  Level Components PLOT
+plot(x=t_ind[-(1:L)], y=stan_fit$Y_signal[-(1:L)],  type="l", col="black", lwd= 3, xlab="", ylim=c(0,max(x, simulated_data)), ylab="KPI + Second Level Components")
+
+abline(v=t_ind[year_marks], col="gray", lty=2)
+
+if(C>0){
+lines(x=t_ind[-(1:L)], y=stan_fit$Y_control[,-(1:L)], type = "l", col="pink", lwd= 2)
+}
+
+lines(x=t_ind[-(1:L)], y=stan_fit$Y_temporal[,-(1:L)],  type="l", col="darkblue", lwd= 2)
+
+lines(x=t_ind[-(1:L)], y=stan_fit$Y_marketing[,-(1:L)], type = "l", col="darkgreen", lwd= 2)
+
+
+
+legend("right",
+         inset = c(-0.27, 0),  # mover hacia afuera (derecha)
+         legend = c("Signal", "Temporal effects", "Advertising effects", "Controls' effect" ),
+         col = c("black", "darkblue", "darkgreen", "pink"), 
+         lwd = c(3, rep(2,3)),
+         lty=1,
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+
+# KPI + Basic Components PLOT
+
+plot(x=t_ind[-(1:L)], y=c(simulated_data[-(1:L)]),  type="l", col="black", lwd= 3, xlab="", ylim=c(0,max(x, simulated_data)), ylab="KPI + Basic Components")
+
+abline(v=t_ind[year_marks], col="gray", lty=2)
+
+lines(x=t_ind[-(1:L)], y=rep(params_list$beta_0,Semanas.Efect),  type="l", col="cyan", lwd= 2)
+lines(x=t_ind[-(1:L)], y=trend,  type="l", col="blue", lwd= 2)
+lines(x=t_ind[-(1:L)], y=seasonal,  type="l", col="purple", lwd= 2)
+
+
+for (i in 1:M){
+lines(x=t_ind[-(1:L)], y=stan_fit$x_hilladstocked[,,i][-(1:L)], type = "l", col=x_dark_colors[i], lwd= 2)
+}
+
+if(C>0){
+for (c in 1:sim_data$C_used){
+lines(x=t_ind[-(1:L)], y=stan_fit$ct_impact[,,c][-(1:L)], type = "l", col=ct_dark_colors[c], lwd= 2)
+}
+}
+
+# Y vs. Covariates
+#####################
+for(m in 1:M){
+plot(covariateplot(Y=simulation$`y_sim[1]`, covariate = simulation[,paste0("x[",m,"]")], labelY="Y",labelcov =paste0("x[",m,"]")))
+}
+
+for(c in 1:C){
+plot(covariateplot(Y=simulation$`y_sim[1]`, covariate = simulation[,paste0("ct[",c,"]")], labelY="Y",labelcov =paste0("ct[",c,"]")))
+}
+
+```
+
+```{r}
+round(simulation$`ROI_x[1]`[1],2)
+round(simulation$`ROI_x[2]`[1],2)
+round(simulation$`ROI_x[3]`[1],2)
+```
+
+
+## A.4 Saving Simulation
+```{r}
+fake_date_col<-which(colnames(simulation)=="fake_date")
+
+write.csv2(simulation,file=paste0(bitacora, "Sim2.csv"))
+write.csv2(simulation[-c(1:3),c(7,9:12,fake_date_col)],file=paste0(bitacora, "Sim2-OBS_Data.csv"))
+```
+
+

@@ -1,0 +1,286 @@
+---
+title: "Robyn Vidhya Example"
+author: "Miguel Franco Pérez"
+date: "2024-10-08"
+output: html_document
+---
+
+# 1. Configuration
+
+```{r eval=FALSE, include=FALSE}
+# FIRST SETTING (takes around 15min)
+
+#    RStudio, Global Options > Python, and uncheck the
+#    box for "Automatically activate project-local Python environments".
+
+library("lubridate")
+library("reticulate")
+install_python()
+virtualenv_create("r-reticulate")
+use_virtualenv("r-reticulate", required = TRUE)
+
+Sys.setenv(RETICULATE_PYTHON = "C:/Users/usuari/anaconda3/envs/r-reticulate/python.exe") #4.
+#Change this route as necessary (look for r-reticulate folder)
+
+py_config() 
+#If here does not show the route on #4:
+
+#    Restart R session, run #4 first, then load library("reticulate"), check
+#    py_config() again, python should have path as in #4.
+#    If you see: "NOTE: Python version was forced by RETICULATE_PYTHON_FALLBACK"
+#    RStudio, Global Options > Python, and uncheck the
+#    box for "Automatically activate project-local Python environments".
+
+py_install("numpy", pip = TRUE)
+py_install("nevergrad", pip = TRUE)
+
+#For more info and other alternatives: https://github.com/facebookexperimental/Robyn/blob/main/demo/install_nevergrad.R
+```
+
+
+```{r}
+#Step 1.a.First Install required Packages
+Sys.setenv(RETICULATE_PYTHON = "C:/Users/usuari/anaconda3/envs/r-reticulate/python.exe") 
+library(Robyn)
+library(reticulate)
+library(lubridate)
+```
+
+```{r}
+#Step 1.c Import packages & set CWD
+set.seed(123)
+
+#Step 1.d You can force multi-core usage by running below line of code
+Sys.setenv(R_FUTURE_FORK_ENABLE = "true")
+options(future.fork.enable = TRUE)
+
+# You can set create_files to FALSE to avoid the creation of files locally
+create_files <- TRUE
+```
+
+# 2. Load Data
+
+```{r}
+#Step 2.a Load data
+Data <- read.csv2("C:/Users/usuari/Dropbox/1.Estudos/A. MASTER (MESIO)/2º Master - 2º Q/Z. TFM - Adsmurai/4. UPC Bayesian/TFM - Simulations/Sim1-OBS_Data.csv")
+head(Data)
+tail(Data)
+
+# Export results to desired directory.
+robyn_object<- "C:/Users/usuari/Dropbox/1.Estudos/A. MASTER (MESIO)/2º Master - 2º Q/Z. TFM - Adsmurai/4. UPC Bayesian/TFM - Simulations/Robyn_Geom_DECOMP1_OUTPUT"
+```
+
+# 3. Model Specification
+
+```{r}
+#### Step 3.1: Specify input variables
+
+#function robyn_inputs
+#?robyn_inputs
+
+InputCollect <- robyn_inputs(
+  
+  ####################
+  # DATA INPUT
+  ####################
+    dt_input = Data,
+  
+  ####################
+  # Y Dependent Variable
+  ####################  
+    dep_var = "y_sim.1.",       # Name
+    dep_var_type = "revenue",  # "revenue", "conversion"
+
+  ####################
+  # Temporal Effects
+  ####################     
+    date_var = "fake_date",        #Variable Name
+  
+    prophet_vars = c("trend", "season"),
+        #c("trend", "season", "holiday", "monthly", "weekday") or NULL
+    
+    #prophet_signs= c("default")  #"default", "positive", "negative"
+    
+    window_start = "2000-01-07",
+    window_end = "2004-01-02",
+    
+  ####################
+  # Adstock (Lagged Effect - Carryover)
+  ####################  
+    adstock = "geometric",  #"geometric","weibull_cdf","weibull_pdf"
+  
+  ####################
+  # X Variables
+  ####################
+  
+  # Internal Variables
+  #-------------------
+  
+  # ----> Spending (€€€)
+  
+  paid_media_spends = c("x.1.", "x.2.", "x.3."),  
+  paid_media_vars = c("x.1.", "x.2.", "x.3."),  
+  
+      #paid_media_spends -> spending (€€€€) on each media
+      #paid_media_vars   -> outcome metrics if available (if not, repeat spending)
+      #                      (impressions, clicks, retweets...)
+  
+  #'paid_media_vars' are not being used to train the model but to check relationship and recommend to split media channels into sub-channels.
+  #Must have same order and length as 'paid_media_spends' respectively and is not required.
+  
+  
+  # ----> Not-spending (or with no clear spending)
+  
+    #organic_vars = c("newsletter"),                 
+    #organic_signs= c("positive")   #"positive", "negative", "default"
+  
+  # External Variables
+  #-------------------
+    context_vars = c("ct.1."),  #External
+  
+
+  # Factor Variables (Internal or External)
+  #-------------------  
+  #factor_vars = c("events"),    #On context_vars OR organic_var
+)
+
+#NOTES:
+
+# 1. We apply transformation techniques to paid_media_vars and organic_vars variables to reflect carryover effects and saturation. However, context_vars directly impact the Target variable and do not require transformation.
+
+# 2. context_vars and organic_vars can accept either continuous or categorical data while paid_media_vars can only accept continuous data.You can mention Organic or context variables with categorical data type under factor_vars parameter.
+
+# 3. For variables organic_vars and context_vars , continuous data will provide more information to the model than categorical. For example, providing the % discount of each promotional offer (which is continuous data) will provide more accurate information to the model compared to a dummy variable that shows the presence of a promotion with just 0 and 1.
+
+print(InputCollect)
+```
+
+```{r}
+#### Step 3.2: Specify hiperparameter names and ranges
+
+
+#?hyper_names
+
+hyper_names(
+  adstock = InputCollect$adstock, 
+  all_media = InputCollect$all_media
+  )
+
+```
+
+```{r}
+## Note: Set plot = TRUE to produce example plots for 
+#adstock & saturation hyperparameters.
+
+  plot_adstock(plot = TRUE)
+  plot_saturation(plot = TRUE)
+```
+
+
+```{r}
+# To check maximum lower and upper bounds
+  hyper_limits()
+```
+
+
+```{r}
+# Specify hyperparameters ranges for Geometric adstock
+hyperparameters <- list(
+  x.1._thetas = c(0.01, 0.9),
+  x.2._thetas = c(0.01, 0.9),
+  x.3._thetas = c(0.01, 0.9),
+  
+  x.1._alphas = c(0.01, 9),
+  x.2._alphas = c(0.01, 9),
+  x.3._alphas = c(0.01, 9),
+  
+  x.1._gammas = c(0.01, 0.9),
+  x.2._gammas = c(0.01, 0.9),
+  x.3._gammas = c(0.01, 0.9),
+
+  train_size = sum(year(Data$fake_date)<2003)/length(Data$fake_date)
+  
+  #This ones got computed from the recomandations of Robyn, we should check where they come from
+  
+  #If just one value passed, it value gets fixed
+)
+```
+
+
+```{r}
+#Add hyperparameters into robyn_inputs()
+
+InputCollect <- robyn_inputs(InputCollect = InputCollect,           
+                             hyperparameters = hyperparameters)
+print(InputCollect)
+```
+
+```{r}
+##### Save InputCollect in the format of JSON file to import later
+robyn_write(InputCollect, dir = "./")
+
+InputCollect <- robyn_inputs(
+  dt_input = Data,
+  json_file = "./RobynModel-inputs.json")
+
+InputCollect
+```
+
+# 5. Model Building
+
+```{r}
+#?robyn_run
+
+#Build an initial model
+
+OutputModels <- robyn_run(
+  seed=12345,
+  quiet=FALSE,
+  #nevergrad_algo="TwoPointsDE",   #Optimization algorithm
+  intercept_sign="unconstrained", #[Default] "non_negative" (!!!!!!)
+                    #Consider changing intercept_sign to "unconstrained" when there are context_vars with large positive values.
+  
+  objective_weights = c(1,1), #c(NRMS, DECOMP.RSSD) - Weights on the optimization objective function c(NRMS, DECOMP.RSSD)
+  
+  rssd_zero_penalty = TRUE, #Overpenalize the models with zero coefficients estimate.
+
+  
+  InputCollect = InputCollect,
+  cores = NULL,             #parallel::detectCores() - 1
+                            #Amount of cores for computing
+  iterations = 3000,
+  trials = 5,
+  
+  ts_validation = TRUE,
+  add_penalty_factor = FALSE
+)
+
+print(OutputModels)
+```
+
+## Convergence Checking
+```{r}
+## Check MOO (multi-objective optimization) convergence plots
+# ?robyn_converge
+OutputModels$convergence$moo_distrb_plot
+OutputModels$convergence$moo_cloud_plot
+```
+
+
+```{r}
+## Calculate Pareto fronts, cluster and export results and plots.
+
+OutputCollect <- robyn_outputs(
+  InputCollect, OutputModels,
+  csv_out = "pareto",
+  pareto_fronts = "auto",
+  clusters = TRUE,
+  export = create_files,
+  plot_pareto = create_files,
+  plot_folder = robyn_object,
+  ui=TRUE
+
+)
+print(OutputCollect)
+```
+

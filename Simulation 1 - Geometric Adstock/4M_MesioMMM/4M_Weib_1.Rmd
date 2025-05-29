@@ -1,0 +1,1250 @@
+---
+title: "MMM - Simulation"
+author: "Miguel Franco Pérez"
+date: "2024-12-16"
+output: html_document
+---
+
+# Pre-Settings
+```{r include=FALSE}
+# Load RStan
+library(rstan)
+library(tidyverse)
+library(bayesplot)
+library(patchwork)
+options(mc.cores = parallel::detectCores()-1)
+
+#Stan model
+stan_file <- "4M_MesioMMM.stan"
+
+#Bitácora folder
+bitacora<-"C:/Users/usuari/Documents/DATA"
+
+##########################################
+#METHODS
+
+Geometric_Methods<- c(1:2)
+Weibull_Methods<- c(3)
+Poisson_Methods <- c(4)
+```
+
+# B. Inference
+
+## B.1 Data for inference
+```{r}
+Sim<-2
+
+Adstock_Method<-3                 
+                  #1 - Geometric Non-Weighted
+                  #2 - Geometric Weighted
+
+                  #3 - Weibull PDF 
+
+                  #4 - Poisson PDF
+
+Trend_Method<-2                   
+                  #1 - Year
+                  #2 - Weekly 
+
+L<-3      #L: cantidad de lags máximos
+```
+
+
+## B.2 Recovering Data from Datafile
+```{r}
+simulation.control<-read.csv2(paste0("C:/Users/usuari/Dropbox/1.Estudos/A. MASTER (MESIO)/2º Master - 2º Q/Z. TFM - Adsmurai/4. UPC Bayesian/TFM - Simulations/Sim",Sim,".csv"), row.names=1)
+
+M<- simulation.control$M[1]
+C<- simulation.control$C[1]
+C_used<- simulation.control$C_used[1]; if(is.null(C_used)){C_used<-C}
+
+used_data<-simulation.control[-(1:L),c(1:5,7,9:(9+M+C_used-1))]
+colnames(used_data)[6]<-"Y"
+
+pre_data<-list()  
+
+pre_data$t_ind<-seq(1:nrow(used_data))
+pre_data$semana_ano<-used_data$semana_ano
+pre_data$semana_mes<-used_data$semana_mes
+pre_data$mes<-used_data$mes
+pre_data$ano<-used_data$ano
+pre_data$Y<-c(used_data[["Y"]])
+pre_data$x<-used_data[7:(7+M-1)]
+pre_data$ct<-used_data[(7+M-1+1):(7+M-1+C_used)]
+pre_data$Adstock_Method<-Adstock_Method
+pre_data$Trend_Method<-Trend_Method
+pre_data$T<-length(pre_data$Y)
+pre_data$M_sim<-1
+pre_data$L<-L
+pre_data$M<-M
+pre_data$C<-C
+pre_data$C_used<-C_used
+pre_data$k<-simulation.control$k
+
+pre_data$x<-as.matrix(pre_data$x)
+pre_data$ct<-as.matrix(pre_data$ct)
+
+pre_data$is_test<-as.numeric(used_data$ano>2002)
+```
+
+## B.3 Running Bayesian Inference
+
+### B.3.1 Prioris
+```{r}
+#################################################
+Y <-simulation.control$y_sim.1.
+
+TildePsi<-aggregate(Y ~ mes, data = used_data, FUN = mean)$Y*0.5
+TildePsi<-TildePsi-mean(TildePsi)
+
+TildeDelta<-c()
+for (c in 1:C){
+  TildeDelta[c]<-lm(as.formula(paste("Y ~", paste0("ct.", c, "."))), data = used_data)$coefficients[2]
+}
+#Relación lineal Y~ct. en ausencia de cualesquiera otras variables.
+
+TildeGamma<-c()
+for (m in 1:M){
+  TildeGamma[m]<- max(used_data[,paste0("x.",m,".")])*L*2
+}
+#Persistencia perfecta del máximo advertising registrado en el doble de lags relevantes
+
+#PRIORIS
+
+hiperpriors<-list(
+ # beta_0 ~ weibull(2, beta_0_scale)   
+  # Ventas basales (Efecto Marca Independiente de Publicidad y Efectos Temporales)
+  beta_0_shape= 2,
+  beta_0_scale= min(Y),   #Large tail but centered on the minimum of the revenue          
+
+ # sigma_e ~ weibull (1, sigma_e_scale)   
+  # Desviación típica (en unidades de KPI-revenue) alrededor de la señal de marketing y temporal
+sigma_e_shape= 1,
+sigma_e_scale= sd(Y)/4, #All the variance come from noise on the large tail
+
+ # tau ~ normal (0, tau_sigma)   
+  # Efecto tendencia (cómo aumentan las ventas basales año a año [Trend_Method==1] o semana a semana [Trend_Method==2])
+tau_mean=0,
+tau_sigma= abs((max(Y)-min(Y)))/3,
+
+ # sigma_psi ~ weibull (sigma_psi_shape, sigma_psi_scale) +  sd(TildePsi) 
+  # Desviación típica (en unidades de KPI-revenue) de las diferencias entre meses en los efectos estacionales
+
+sigma_psi_mean= sd(TildePsi),
+sigma_psi_sigma= sd(TildePsi)/2,
+
+#---------------------------    X[M]     --------------------------------------
+
+# ADSTOCK GEOMETRIC
+#-------------------
+ # theta_x1 ~ beta(6, 10)
+theta_x_a=array(rep(6,M)),
+theta_x_b=array(rep(10,M)),
+
+# ADSTOCK WEIBULL
+#-------------------
+ # shape_x1 ~ weibull(1, 1)
+shape_x_shape=array(rep(1,M)),
+shape_x_scale=array(rep(0.75,M)),
+
+ # scale_x1 ~ weibull(1,3)
+scale_x_shape=array(rep(1,M)),
+scale_x_scale=array(rep(3,M)),
+
+# ADSTOCK POISSON
+#-------------------
+ # lambda_x1 ~ uniform(lambda_x_min, lambda_x_max)  
+
+lambda_x_min=array(rep(0,M)),
+lambda_x_max=array(rep(L,M)),
+
+# SATURATION
+##################
+ # beta_x1 ~ weibull(1, beta_x_scale)
+  # Techo de KPI-revenue que se consigue con la saturación del medio X1
+beta_x_shape=array(rep(1,M)),
+beta_x_scale=array(rep(max(Y)/4,M)), 
+
+ # gamma_x1 ~ weibull(2, gamma_x_scale)   
+  # Valor del adstocked_xi de semisaturación del medio x1
+gamma_x_shape=array(rep(2,M)),
+gamma_x_scale=array(TildeGamma), 
+
+ # alpha_x1 ~ weibull(2, alpha_x_scale)   
+  # Forma de la función de saturación (smaller C  - Bigger S)
+alpha_x_shape=array(rep(2,M)),
+alpha_x_scale=array(rep(5,M)),
+
+#---------------------------    Ct[c]     --------------------------------------
+ # beta_ct ~ normal (0, beta_ct_sigma)   
+  # Efecto tendencia (cómo aumentan las ventas basales año a año [Trend_Method==1] o semana a semana [Trend_Method==2])
+beta_ct_mu=array(rep(2,C)),
+beta_ct_sigma=array(TildeDelta)
+
+)
+
+data<-c(pre_data,hiperpriors)
+```
+
+
+### B.3.2 Init function
+```{r}
+
+set.seed(12345)
+
+TildeIncr<-mean(Y[floor(0.85*length(Y)):length(Y)]) - mean(Y[1:floor(0.15*length(Y))]) 
+#Mean(Last 15% obs) - Mean(First 15% obs)
+TildeTau<-TildeIncr/length(Y)
+
+#INIT.GUESS 
+
+init.guess<-function(){return(list(
+  beta_0=abs(rnorm(n=1, mean=min(Y), 
+                   sd=min(Y)*0.1)),   #Around Minimum Y
+  
+  sigma_e=abs(rnorm(n=1, mean=sd(Y)/(C+M+1), sd=sd(Y)/(C+M+1)*0.1)),  #Around SD(Y)/(M+C+1) - equidistribution of sd between covariates(M+C) and Y itself (+1)
+  
+  tau=rnorm(n=1, mean=TildeTau, sd=TildeTau*0.1),
+  #Around difference between mean of the last 15% observations and mean of the first 15% observations divided by length of the time-serie 
+  
+  sigma_psi=abs(rnorm(n=1, mean=sd(TildePsi), sd=sd(TildePsi)*0.1)),
+  
+  psi=unlist(lapply(TildePsi, function(x) rnorm(n=1, mean=x, sd=abs(x*0.1)))),
+    
+  
+  #Inits de X
+  theta_x=rep(abs(rnorm(n=1, mean=0.2, sd=0.2*0.1)),M),
+  #Around 0.2
+  
+  shape_x=rep(abs(rnorm(n=1, mean=1.5, sd=0.3)),M),
+  #Around 1.5
+  
+  scale_x=rep(abs(rnorm(n=1, mean=1, sd=0.2)),M),
+  #Around 1
+  
+  lambda_x=rep(min(L,abs(rnorm(n=1, mean=L/2, sd=L/2*0.1))),M),
+  #Around half of the maximum Lags on the model
+  
+  beta_x=rep(abs(rnorm(n=1, 
+                       mean=mean(Y)/(M+C+1),
+                      sd=mean(Y)/(M+C+1)*0.1))
+             ,M),
+  #Around equidistribution of mean(Y) between covariates(M+C) and temporal effects itself (+1)
+  
+  gamma_x=sapply(colMeans(pre_data$x), function(m) rnorm(1, mean = m, sd = 0.1 * m)), 
+  # Gasto medio en cada canal
+  
+  alpha_x=rep(abs(rnorm(n=1, mean=2, sd=0.75)),M),
+  #Around 2
+  
+  beta_ct=array(unlist(lapply(TildeDelta, function(x) rnorm(n=1, mean=x, sd=abs(x*0.1)))))
+
+))}
+
+```
+
+
+### B.3.3 MCMC
+```{r}
+  chains<-4
+  warmup<-30000
+  thin<- 2
+  posterior_per_chain<- 2000
+  
+  iter<-warmup+(posterior_per_chain*thin)
+  cat("Iterations per chain:", iter)
+  cat("\n Posterior samples:", posterior_per_chain*chains)
+  
+system.time(
+  fit <- stan(
+    file = stan_file, 
+    data = data,
+    chains = chains,           # Número de cadenas
+    iter = warmup+(posterior_per_chain*thin),          # Iteraciones totales (incluyendo calentamiento)
+    warmup = warmup,         # Iteraciones de calentamiento
+    thin= thin,
+    init = init.guess,   
+    seed = 1234,# Para reproducibilidad
+    cores= parallel::detectCores()-1,
+    verbose=FALSE
+  )
+)
+
+```
+
+## B.4 Checking Inference Results & Convergence
+
+### B.4.1. Defining Parameters to verify
+```{r}
+params_General<-c("NRMSE","beta_0", "sigma_e", "tau", "sigma_psi")
+
+params_Seasonal<-apply(expand.grid(c("psi"), as.character(seq(1:12))), 1, function(x) paste0(x[1], "[", x[2], "]"))
+params_Seasonal_n<-length(params_Seasonal)/M
+
+params_x<-apply(expand.grid(c( 
+  if (Adstock_Method %in% Geometric_Methods) {c("theta_x")}
+  else if (Adstock_Method %in% Weibull_Methods) {c("shape_x", "scale_x")}
+  else if (data$Adstock_Method %in% Poisson_Methods) {c("lambda_x")},
+  "beta_x", "gamma_w_x", "alpha_x"), seq(1:M)), 1, function(x) paste0(x[1], "[", x[2], "]"))
+params_x_n<-length(params_x)/M
+
+params_Applied <-apply(expand.grid(c("ROI_x", "RE_Signal_x"), as.character(seq(1:M))), 1, function(x) paste0(x[1], "[", x[2], "]"))
+params_Applied_n<-length(params_Applied)/M
+
+params_Control<-apply(expand.grid(c("beta_ct", "RE_Signal_ct"), seq(1:C_used)), 1, function(x) paste0(x[1], "[", x[2], "]"))
+params_Control_n<-length(params_Control)/C_used
+
+params_Ratio <- c("RE_Signal_basalTrend","RE_Signal_Y_temporal","RE_Signal_Y_Marketing","RE_Temporal_trend") 
+
+year_marks<- c(FALSE, diff(used_data$ano) != 0)
+```
+
+### B.4.2. Table Summary
+```{r}
+CredibleIntWidth<-0.95
+probsQuant<-(1-CredibleIntWidth)/2
+
+posterior <- as.matrix(fit)
+params<-colnames(posterior)
+print(fit, probs = c(probsQuant, 1-probsQuant), pars = c("NRMSE","ROI_x","beta_0", "sigma_e", "tau", params_Ratio,
+    if (data$Adstock_Method %in% Geometric_Methods) {c("theta_x")}
+    else if (data$Adstock_Method %in% Weibull_Methods) {c("shape_x", "scale_x")}
+    else if (data$Adstock_Method %in% Poisson_Methods) {c("lambda_x")}
+                                           ,"beta_ct","beta_x","gamma_w_x", "alpha_x", "RE_Signal_x","RE_Signal_ct","psi"))
+```
+
+```{r eval=FALSE, include=FALSE}
+fit
+```
+
+### B.4.3. Chains
+```{r}
+Warmup<-FALSE
+
+if(simulation.control$Generation_Adstock_Method[1]==data$Adstock_Method){ color<-"black"} else {
+  color<-"red"
+  warning(" \n Non-correspondent adstock method for generation and for estimation \n")
+}
+
+Agglist_General<-list()
+
+for (param in params_General){
+
+  Agglist_General[[param]]<-rstan:::traceplot(fit, inc_warmup=Warmup,pars=param) + 
+    geom_hline(yintercept = simulation.control[[param]][1], color = color, linetype = "dashed", lwd = 1) +
+    labs(title = param) +
+    theme(legend.position = "none",
+          axis.title.y = element_blank(), 
+          axis.ticks.y = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(size = 10))
+}
+
+Agglist_Seasonal<-list()
+
+for (param in params_Seasonal){
+  param_corrected_name<-gsub("\\[|\\]", ".", param)
+  
+  Agglist_Seasonal[[param]]<-rstan:::traceplot(fit, inc_warmup=Warmup,pars=param) +
+    geom_hline(yintercept = simulation.control[[param_corrected_name]][1], color = color, linetype = "dashed", lwd = 1) +
+    labs(title = param) +
+    theme(legend.position = "none",
+          axis.title.y = element_blank(), 
+          axis.ticks.y = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(size = 10))
+    
+}
+
+Agglist_X<-list()
+
+for (param in params_x){
+  param_corrected_name<-gsub("\\[|\\]", ".", param)
+  
+  Agglist_X[[param]]<-rstan:::traceplot(fit, inc_warmup=Warmup,pars=param) +
+    geom_hline(yintercept = simulation.control[[param_corrected_name]][1], color = color, linetype = "dashed", lwd = 1) +
+    labs(title = param) +
+    theme(legend.position = "none",
+          axis.title.y = element_blank(), 
+          axis.ticks.y = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(size = 10))
+    
+}
+
+  Agglist_Control<-list()
+  
+  for (param in params_Control){
+    param_corrected_name<-gsub("\\[|\\]", ".", param)
+    
+    Agglist_Control[[param]]<-rstan:::traceplot(fit, inc_warmup=Warmup,pars=param) +
+      geom_hline(yintercept = simulation.control[[param_corrected_name]][1], color = color, linetype = "dashed", lwd = 1) +
+      labs(title = param) +
+      theme(legend.position = "none",
+            axis.title.y = element_blank(), 
+            axis.ticks.y = element_blank(),
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            plot.title = element_text(size = 10))
+      
+  }
+
+Agglist_Applied<-list()
+
+for (param in params_Applied){
+  param_corrected_name<-gsub("\\[|\\]", ".", param)
+  
+  Agglist_Applied[[param]]<-rstan:::traceplot(fit, inc_warmup=Warmup,pars=param) +
+    geom_hline(yintercept = simulation.control[[param_corrected_name]][1], color = color, linetype = "dashed", lwd = 1) +
+    labs(title = param) +
+    theme(legend.position = "none",
+          axis.title.y = element_blank(), 
+          axis.ticks.y = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(size = 10))
+    
+}
+
+Agglist_Ratio<-list()
+
+for (param in params_Ratio){
+  Agglist_Ratio[[param]]<-rstan:::traceplot(fit, inc_warmup=Warmup,pars=param) + 
+    geom_hline(yintercept = simulation.control[[param]][1], color = color, linetype = "dashed", lwd = 1) +
+    labs(title = param) +
+    theme(legend.position = "none",
+          axis.title.y = element_blank(), 
+          axis.ticks.y = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(size = 10))
+    
+}
+```
+
+
+```{r}
+wrap_plots(Agglist_General) + plot_layout(nrow=1, guides = "collect")
+wrap_plots(Agglist_Seasonal) + plot_layout(nrow=3, guides = "collect")
+wrap_plots(Agglist_Ratio) + plot_layout(nrow=1, guides = "collect")
+wrap_plots(Agglist_X) + plot_layout(nrow=M, guides = "collect")
+wrap_plots(Agglist_Control) + plot_layout(nrow=C_used, guides = "collect")
+wrap_plots(Agglist_Applied) + plot_layout(nrow=M, guides = "collect")
+```
+
+
+### B.4.4. Pairs Plot
+```{r eval=FALSE, warning=FALSE, include=FALSE}
+pairs(fit, pars=c(params_General,params_x))
+```
+
+
+### B.4.5. ACF
+```{r eval=FALSE, warning=FALSE, include=FALSE}
+par(mfrow=c(1,4))
+for (i in params_General){  acf(posterior[, i], main=i)}
+
+par(mfrow=c(3,4))
+for (i in params_Seasonal){  acf(posterior[, i], main=i)}
+
+par(mfrow=c(2,max(params_x_n,2)))
+for (i in params_x){  acf(posterior[, i], main=i)}
+
+if(C>0){
+par(mfrow=c(2,max(params_Control_n,2)))
+for (i in params_Control){  acf(posterior[, i], main=i)}
+}
+
+par(mfrow=c(2,params_Applied_n))
+for (i in params_Applied){  acf(posterior[, i], main=i)}
+
+par(mfrow=c(1,length(params_Ratio)))
+try(for (i in params_Ratio){  acf(posterior[, i], main=i)})
+```
+
+### B.4.6. Residuals Plot
+```{r}
+residualplot<-function(residuals, covariate, label=NULL){
+
+if(is.null(label)){
+  label<-deparse(substitute(covariate))
+}
+df <- data.frame(Y = covariate, residuals = residuals)
+  
+# Ajuste loess
+loess_fit <- loess(residuals ~ Y, data = df)
+df$fit <- predict(loess_fit)
+
+# Calcular densidad local
+density_vals <- density(df$Y)
+df$density <- approx(density_vals$x, density_vals$y, xout = df$Y)$y
+
+# Normalizar densidad para controlar grosor
+df$linewidth <- scales::rescale(df$density, to = c(0.001, 2))
+
+# Graficar línea por segmentos
+g<-ggplot(df, aes(x = Y, y = fit)) +
+  geom_point(aes(y = residuals), alpha = 0.5) +
+  geom_segment(data = df %>% arrange(Y) %>% mutate(Y2 = lead(Y), fit2 = lead(fit), linewidth2 = lead(linewidth)),
+               aes(xend = Y2, yend = fit2, size = linewidth2), lineend = "round", color = "blue")+
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_size_identity() +
+  labs(title = paste0("Residuals vs ",label))+
+  ylab("residual")+ xlab(label)
+
+return(g)
+}
+```
+
+```{r}
+y_hat_mean<-c()
+for(t in 1:data$T){
+  y_hat_mean[t]<-mean(posterior[,paste0("y_hat[",t,"]")])
+}
+
+residuals<-data$Y-y_hat_mean
+
+# RESIDUALS HISTOGRAM + QQ-PLOT
+###############################
+par(mfrow=c(1,2))
+  #Normal plot of residuals
+  qqnorm(residuals)
+  qqline(residuals,col=2,lwd=2)
+  
+  ##Histogram of residuals with normal curve
+  hist(residuals,breaks=20,freq=FALSE)
+  curve(dnorm(x,mean=mean(residuals),sd=sd(residuals)),col=2,add=T, lwd=2)
+
+# RESIDUALS ACF - PACF
+###############################
+  par(mfrow=c(2,2))
+
+  counter<-0
+for (var in list(residuals,residuals^2)){
+  counter<-counter+1
+  acf(var, main="", ylim=c(-1,1)); title(main = c("residuals","(residuals)^2")[counter])
+  pacf(var, ylab="PACF", ylim=c(-1,1), main=""); title(main = c("residuals","(residuals)^2")[counter])
+}
+
+# RESIDUALS PLOT
+###############################
+
+#Against time
+  par(mfrow=c(2,1),mar=c(4,4,3,3))
+  #Residuals plot
+  plot(residuals,main="Residuals", type="l", xlab="t", ylab="residuals", lwd=2)
+  abline(h=0)
+  abline(h=c(-3*sd(residuals),3*sd(residuals)),lty=3,col=4)
+  abline(v=which(diff(data$is_test) == 1) + 1, col="firebrick", lty=1, lwd=4)
+  abline(v=data$t_ind[year_marks], col="gray", lty=2, lwd=2)
+  #Square Root of absolute values of residuals (Homocedasticity)
+  scatter.smooth(sqrt(abs(residuals)),main="Square Root of Absolute residuals",
+                 lpars=list(col="blue", lwd=2), xlab="t", ylab="(residuals)^0.5")
+   abline(v=which(diff(data$is_test) == 1) + 1, col="firebrick", lty=1, lwd=4)
+   abline(v=data$t_ind[year_marks], col="gray", lty=2, lwd=2)
+  
+#Against other covariates
+residualplot(residuals = residuals, covariate = data$t_ind, label="t")+
+  geom_vline(xintercept =data$t_ind[year_marks], color="gray", size=1, lty=2)+
+  geom_vline(xintercept = which(diff(data$is_test) == 1) + 1, color="firebrick", size=1)
+
+residualplot(residuals = residuals, covariate = data$mes, label="Mes")
+
+residualplot(residuals = residuals, covariate = data$Y, label="Y")
+
+for(m in 1:M){
+plot(residualplot(residuals = residuals, covariate = used_data[,paste0("x.",m,".")], label=paste0("x.",m,".")))
+}
+
+for(c in 1:C){
+plot(residualplot(residuals = residuals, covariate = used_data[,paste0("ct.",c,".")], label=paste0("ct.",c,".")))
+}
+
+```
+
+
+## B.5. Analizing Results
+
+#### B.5.1 Temporal Effects
+```{r}
+for (TYPE in c(T)){
+    par(mfrow=c(4,1), mar=c(2, 4, 1, 15))
+    
+    #COMPUTATIONS
+    ###############
+    
+    # Basal t0
+    #-----------------------
+    beta0_real<-simulation.control$beta_0[1]
+    beta0_post<-matrix(data=NA,nrow = nrow(posterior),ncol=length(data$t_ind))
+    for (sim in 1:nrow(posterior)){
+          beta0_post[sim,]<-posterior[sim,"beta_0"]
+    }
+    
+    # Trend
+    #-----------------------
+    trend_real<-data$t_ind*simulation.control$tau[1]
+    trend_post<-matrix(data=NA,nrow = nrow(posterior),ncol=length(data$t_ind))
+    for (sim in 1:nrow(posterior)){
+          trend_post[sim,]<-data$t_ind*posterior[sim,"tau"]
+    }
+    
+    # Seasonality
+    #-----------------------
+    psi.corrected<-gsub("\\[|\\]", ".", params_Seasonal)
+    
+    seasonality_real<-c(t(simulation.control[1,psi.corrected])[data$mes])
+    seasonality_post<-matrix(data=NA,nrow = nrow(posterior),ncol=length(data$t_ind))
+    for (sim in 1:nrow(posterior)){
+          seasonality_post[sim,]<-c(t(posterior[sim,params_Seasonal])[data$mes])
+    }
+    
+    # Temporal Effects
+    #-----------------------
+    
+        temporal_real<- beta0_real+trend_real + seasonality_real
+        temporal_post<- beta0_post+trend_post + seasonality_post
+        
+    # Y
+    #-----------------------
+    y_real<-simulation.control$Y_signal[-(1:L)]
+    y_post<-matrix(data=NA,nrow = nrow(posterior),ncol=length(data$t_ind))
+    for (t in 1:length(data$t_ind)){
+          y_post[,t]<-posterior[,paste0("Y_signal[",t,"]")]
+    }
+    
+    YLIM<-range(beta0_real, trend_real, seasonality_real, temporal_real,y_real, 
+                beta0_post, trend_post, seasonality_post, temporal_post,y_post)
+    
+    #PLOTTING
+    ###############
+    
+    # Basal t0
+    #-----------------------
+      plot(x=data$t_ind, y = rep(beta0_real,data$T), type = "l", col="blue", lwd= 2,
+           ylab="Basal t0", main="Temporal Effects Posterior",
+           xlim=c(0, max(data$t_ind)), 
+           if(TYPE==T){ylim=YLIM}else{ylim=range(beta0_real,beta0_post)}
+      )
+    abline(h=0, col="gray", lwd= 1, lty=1)
+    abline(v=data$t_ind[year_marks], col="gray", lty=2)
+    
+    for (sim in 1:nrow(posterior)){
+      lines(x=data$t_ind, y = beta0_post[sim,], type = "l", col=adjustcolor("lightblue", alpha.f = 0.3))
+    }
+        lines(x=data$t_ind, y = rep(beta0_real,data$T), type = "l", col="blue", lwd= 2)
+        abline(v=which(diff(data$is_test) == 1) + 1, col="firebrick", lty=1, lwd=2)
+        
+         legend("right",
+         inset = c(-0.4, 0),
+         legend = c("Real Value","Posterior Simulations", "Train-Test Split"),
+         col = c("blue", "lightblue", "firebrick"), 
+         lwd = c(2, 4, 2),
+         lty=c(1,1),
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+    
+    # Trend
+    #-----------------------
+      plot(x=data$t_ind, y = trend_real, type = "l", col="blue", lwd= 2,
+           ylab="Trend", 
+           xlim=c(0, max(data$t_ind)), 
+           if(TYPE==T){ylim=YLIM}else{ylim=range(trend_real,trend_post)})
+      abline(h=0, col="gray", lwd= 1, lty=1)
+      abline(v=data$t_ind[year_marks], col="gray", lty=2)
+      
+    for (sim in 1:nrow(posterior)){
+      lines(x=data$t_ind, y = trend_post[sim,], type = "l", col=adjustcolor("lightblue", alpha.f = 0.3))
+    }
+        lines(x=data$t_ind, y = trend_real, type = "l", col="blue", lwd= 2)
+        abline(v=which(diff(data$is_test) == 1) + 1, col="firebrick", lty=1, lwd=2)
+        
+         legend("right",
+         inset = c(-0.4, 0),
+         legend = c("Real Value","Posterior Simulations", "Train-Test Split"),
+         col = c("blue", "lightblue", "firebrick"), 
+         lwd = c(2, 4, 2),
+         lty=c(1,1),
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+    
+    # Seasonality
+    #-----------------------
+    psi.corrected<-gsub("\\[|\\]", ".", params_Seasonal)
+    
+      plot(x=data$t_ind, y = seasonality_real, type = "l", col="blue", lwd= 2,
+           ylab="Seasonality", 
+           xlim=c(0, max(data$t_ind)), 
+           if(TYPE==T){ylim=YLIM}else{ylim=range(seasonality_real,seasonality_post)})
+        abline(h=0, col="gray", lwd= 1, lty=1)
+        abline(v=data$t_ind[year_marks], col="gray", lty=2)
+        
+    for (sim in 1:nrow(posterior)){
+      lines(x=data$t_ind, y = seasonality_post[sim,], type = "l", col=adjustcolor("lightblue", alpha.f = 0.3))
+    }
+        lines(x=data$t_ind, y = seasonality_real, type = "l", col="blue", lwd= 2)
+        abline(v=which(diff(data$is_test) == 1) + 1, col="firebrick", lty=1, lwd=2)
+        
+         legend("right",
+         inset = c(-0.4, 0),
+         legend = c("Real Value","Posterior Simulations", "Train-Test Split"),
+         col = c("blue", "lightblue", "firebrick"), 
+         lwd = c(2, 4, 2),
+         lty=c(1,1),
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+    
+    # Temporal Effects
+    #-----------------------
+        par(mar=c(4, 4, 1, 15))
+      plot(x=data$t_ind, y = temporal_real, type = "l", col="blue", lwd= 2,
+           ylab="Temporal Effects",  xlab="t",
+           xlim=c(0, max(data$t_ind)), 
+           if(TYPE==T){ylim=YLIM}else{ylim=range(temporal_real,temporal_post)})
+      abline(h=0, col="gray", lwd= 1, lty=1)
+      abline(v=data$t_ind[year_marks], col="gray", lty=2)
+      
+    for (sim in 1:nrow(posterior)){
+      lines(x=data$t_ind, y = temporal_post[sim,], type = "l", col=adjustcolor("lightblue", alpha.f = 0.3))
+    }
+        lines(x=data$t_ind, y = temporal_real, type = "l", col="blue", lwd= 2)
+        abline(v=which(diff(data$is_test) == 1) + 1, col="firebrick", lty=1, lwd=2)
+        
+         legend("right",
+         inset = c(-0.4, 0),
+         legend = c("Real Value","Posterior Simulations", "Train-Test Split"),
+         col = c("blue", "lightblue", "firebrick"), 
+         lwd = c(2, 4, 2),
+         lty=c(1,1),
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+}    
+```
+
+#### B.5.2 Decay Curves
+
+```{r}
+x_darker_colors <- c("x1" = "#6a1807", "x2" = "#084b07", "x3" = "#0d4678")
+x_dark_colors <- c("x1" = "#f9380e", "x2" = "#0c810b", "x3" = "#1480df")
+x_light_colors <- c("x1" = "#f7a290", "x2" = "#b8f3b7", "x3" = "#89bae5")
+
+ct_dark_colors <- c("ct1" = "#bd07af")
+ct_light_colors <- c("ct1" = "#e1b6de")
+
+# DECAY CURVES
+#######################################
+t_rang<-seq(0,L,0.5) # Rango para funciones continuas
+d_rang<-seq(0,L,1)              # Rango para funciones discretas
+
+# FUNCTIONS
+GeomDecay<- function(t, theta){
+    theta^t
+}
+
+s_mode_weibull <- function(shape, scale) {
+  ifelse(shape > 1, (scale * ((shape - 1) / shape)^(1 / shape)), 0.001)
+         # Mode is undefined for shape <= 1
+  }
+
+WeibullDecay<- function(t, shape, scale){
+    dweibull(x=t, shape=shape, scale=scale)/dweibull(x=s_mode_weibull(shape,scale), shape=shape, scale=scale)
+  
+}
+
+PoissonDecay <- function(t, lambda){
+    dpois(x=t, lambda = lambda)
+}
+
+#COMPUTING & PLOTTING
+par(mfrow=c(1,M), mar=c(8,2,2,2))
+for(m in 1:M){
+  
+if(simulation.control$Generation_Adstock_Method[1] %in% Geometric_Methods){
+    real_rang<-t_rang
+    real_y_rang<-GeomDecay(t=real_rang, theta=simulation.control[1,paste0("theta_x.",m,".")])
+  }else  if(simulation.control$Generation_Adstock_Method[1] %in% Weibull_Methods){
+    real_rang<-t_rang
+    real_y_rang<-WeibullDecay(t=real_rang, 
+                              shape=simulation.control[1,paste0("shape_x.",m,".")], 
+                              scale=simulation.control[1,paste0("scale_x.",m,".")])
+  }else  if(simulation.control$Generation_Adstock_Method[1] %in% Poisson_Methods){
+    real_rang<-d_rang
+    real_y_rang<-PoissonDecay(t=real_rang, 
+                              lambda=simulation.control[1,paste0("lambda_x.",m,".")])
+  }
+
+if(Adstock_Method %in% Geometric_Methods){
+    rang_post<-t_rang
+    Decay_post<-GeomDecay
+  }else  if(Adstock_Method %in% Weibull_Methods){
+    rang_post<-t_rang
+    Decay_post<- WeibullDecay
+  }else  if(Adstock_Method %in% Poisson_Methods){
+    rang_post<-d_rang
+    Decay_post<-PoissonDecay
+  }
+
+  
+  y_rang_post<-matrix(data=NA,nrow = nrow(posterior),ncol=length(rang_post))
+  
+    for (sim in 1:nrow(posterior)){
+      y_rang_post[sim,]<-c( Decay_post(t=rang_post, 
+                                       shape = posterior[sim,paste0("shape_x[",m,"]")],
+                                       scale = posterior[sim,paste0("scale_x[",m,"]")])  )
+  }
+  
+plot(x=real_rang, 
+     y=real_y_rang,
+     type="l",
+     lty=3,
+     main=paste0("Media x[",m,"] Decay"),
+     ylab="w_s lag weight",
+     xlab="Lag s",
+     ylim=c(0,1),
+     col=NA,
+     lwd=1.25)
+abline(v=seq(1,max(real_rang),1), col="lightgrey", lty=2)  
+
+for (sim in 1:nrow(posterior)){
+  lines(x=rang_post, y=y_rang_post[sim,], col=x_light_colors[m], lty=1)
+}
+lines(x=real_rang, y=real_y_rang, col=x_dark_colors[m], lty=3, lwd=2)
+
+abline(h=0)
+
+for (sim in 1:nrow(posterior)){
+  points(x = rang_post[which(rang_post %% 1 == 0)],
+       y = y_rang_post[sim,][which(rang_post %% 1 == 0)],
+        type = "p",
+        pch = 16,  
+        cex=1,
+        col = x_darker_colors[m])
+}
+
+abline(h=1, col="darkgrey") 
+
+points(x = real_rang[which(real_rang %% 1 == 0)],
+       y = real_y_rang[which(real_rang %% 1 == 0)],
+       type = "p",
+       pch = 16,  
+       cex=2,
+       col = x_dark_colors[m])
+}
+```
+
+#### B.5.2 Saturation Curves
+```{r}
+x_rang<-seq(0,max(data$x),max(data$x)*0.01)
+Hill<- function(x, alpha, gamma, beta=1){
+    beta*1/(1+ (gamma/x)^alpha)
+}
+
+for(lim_type in c(1,2)){
+
+par(mfrow=c(1,M),mar = c(8, 5, 5, 2))  # Increase the bottom margin (first value)
+
+for (i in 1:M){
+  
+  y_rang_post<-matrix(data=NA,nrow = nrow(posterior),ncol=length(x_rang))
+  
+    for (sim in 1:nrow(posterior)){
+      y_rang_post[sim,]<-c(Hill(x=x_rang, beta=posterior[sim,paste0("beta_x[",i,"]")], alpha=posterior[sim,paste0("alpha_x[",i,"]")], gamma = posterior[sim,paste0("gamma_x[",i,"]")]))
+  }
+  
+  y_rang_real<-Hill(x=x_rang, beta=simulation.control[1,paste0("beta_x.",i,".")], alpha=simulation.control[1,paste0("alpha_x.",i,".")], gamma = simulation.control[1,paste0("gamma_w_x.",i,".")])
+  
+  plot(x=x_rang, y = y_rang_real, type = "l", main = paste0("Posterior \n Saturation Hill function \n", "Channel x[", i,"]"), xlab=paste0("x_ads[", i, "]"), ylab="Revenue", xlim=c(0, max(x_rang)), 
+       ylim=c(0,ifelse(lim_type==1,max(y_rang_real, y_rang_post),1.5*simulation.control[1,paste0("beta_x.",i,".")])  
+              ),
+       col=x_dark_colors[i])
+  
+for (sim in 1:nrow(posterior)){
+  lines(x=x_rang, y = y_rang_post[sim,], type = "l", col=adjustcolor(x_light_colors[i], alpha.f = 0.3))
+  }
+  
+    abline(h=simulation.control[1,paste0("beta_x.",i,".")], col="black", lwd=1, lty=3)
+  
+  abline(a = 0, b = 1, col = "brown", lwd = 2)
+  x_fill <- seq(par("usr")[1], par("usr")[2], length.out = 100)
+  y_fill <- x_fill  # Como y = x
+  polygon(c(x_fill, rev(x_fill)), c(y_fill, rep(par("usr")[3], length(y_fill))),
+        col = rgb(0.6, 0.2, 0.1, 0.50), border = NA)
+    
+  abline(a = 0, b = 1, col = "brown", lwd = 2)
+  lines(x=x_rang, y = y_rang_real, type = "l", col=x_dark_colors[i], lwd=2, lty=1)
+}}
+
+```
+
+#### B.5.3 KPI & Hilladstock(x)
+
+```{r}
+#COMPUTATIONS
+##############
+    
+    # Y
+    #-----------------------
+    y_real<-simulation.control$Y_signal[-(1:L)]
+    y_post<-matrix(data=NA,nrow = nrow(posterior),ncol=length(data$t_ind))
+    for (t in 1:length(data$t_ind)){
+          y_post[,t]<-posterior[,paste0("Y_signal[",t,"]")]
+    }
+    
+    # Y_MARKETING
+    #-----------------------
+    y_marketing_real<-simulation.control$Y_Marketing[-(1:L)]
+    y_marketing_post<-matrix(data=NA,nrow = nrow(posterior),ncol=length(data$t_ind))
+    for (t in 1:length(data$t_ind)){
+          y_marketing_post[,t]<-posterior[,paste0("Y_marketing[",t,"]")]
+    }
+
+    # Hilladstock X
+    #-----------------------
+    x_hilladstocked_real<-array(data=NA,c(length(data$t_ind),M)) 
+    x_hilladstocked_post<-array(data=NA,c(M,nrow(posterior),length(data$t_ind))) 
+        # M x Sim x T
+    for (m in 1:M){
+      x_hilladstocked_real[,m]<-simulation.control[-(1:L),paste0("x_hilladstocked.",m,".")]
+      
+      for (t in 1:length(data$t_ind)){
+            x_hilladstocked_post[m,,t]<-posterior[,paste0("x_hilladstocked[",t,",",m,"]")]
+      }
+    }
+    
+
+#PLOTTING
+###############
+    YLIM<-range(x_hilladstocked_real, x_hilladstocked_post, y_real, y_post)
+    
+    colors<-list(c("#f9380e", "#f7a290"),
+                 c("#0c810b","#b8f3b7"),
+                 c("#1480df", "#89bae5"))
+    
+for (TYPE in c(T)){
+  
+  par(mfrow=c(M+1,1), mar = c(2, 6, 1, 15))
+      
+  
+      # Y_Marketing
+      #-----------------------
+          
+      plot(x=data$t_ind, y = y_marketing_real, type = "l",lwd= 2,
+             xlab="",
+             xlim=c(0, max(data$t_ind)),
+             ylab="Σ Hilladstock",
+           main="Marketing Effects",
+             ylim=if(TYPE==T){ylim=YLIM}else{ylim=range(y_marketing_real,y_marketing_post)}
+        )
+
+  
+  for (sim in 1:nrow(posterior)){
+        lines(x=data$t_ind, y = y_marketing_post[sim,], type = "l", col="grey")
+      }
+          lines(x=data$t_ind, y = y_marketing_real, type = "l", col="black", lwd= 2) 
+          
+          abline(v=data$t_ind[year_marks], col="gray", lty=2)
+      abline(v=which(diff(data$is_test) == 1) + 1, col="firebrick", lty=1, lwd=2)
+        
+         legend("right",
+         inset = c(-0.4, 0),
+         legend = c("Real Value","Posterior Simulations", "Train-Test Split"),
+         col = c("black", "grey", "firebrick"), 
+         lwd = c(2, 4, 2),
+         lty=c(1,1),
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+  
+      # Hilladstock X
+      #-----------------------
+  for (m in 1:M){
+        plot(x=data$t_ind, y = x_hilladstocked_real[,m], type = "l", col=NA, lwd= 2,
+             xlab="",
+             ylab=paste0("Hilladstock \n Channel ", m), 
+             xlim=c(0, max(data$t_ind)),
+             ylim=if(TYPE==T){ylim=YLIM}else{ylim=range(x_hilladstocked_real,x_hilladstocked_post)}
+                    )
+      
+      for (sim in 1:nrow(posterior)){
+        lines(x=data$t_ind, y = x_hilladstocked_post[m,sim,], type = "l", col=colors[[m]][2])
+      }
+          lines(x=data$t_ind, y = x_hilladstocked_real[,m], type = "l", col=colors[[m]][1], lwd= 2)
+          abline(v=data$t_ind[year_marks], col="gray", lty=2)
+          abline(v=which(diff(data$is_test) == 1) + 1, col="firebrick", lty=1, lwd=2)
+        
+         legend("right",
+         inset = c(-0.4, 0),
+         legend = c("Real Value","Posterior Simulations", "Train-Test Split"),
+         col = c(colors[[m]][1], colors[[m]][2], "firebrick"), 
+         lwd = c(2, 4, 2),
+         lty=c(1,1),
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+  }
+
+}
+```
+
+#### B.5.4 KPI & Impact_ct(ct)
+
+```{r}
+if(C>0){
+#COMPUTATIONS
+##############
+  
+  colors<-list(c("#bd07af","#e1b6de"))
+  
+    # Impact_ct
+    #-----------------------
+    ct_impact_real<-array(data=NA,c(length(data$t_ind),C_used)) 
+    ct_impact_post<-array(data=NA,c(C_used,nrow(posterior),length(data$t_ind))) 
+        # C x Sim x T
+    for (c in 1:C_used){
+      ct_impact_real[,c]<-simulation.control[-(1:L),paste0("ct_impact.",c,".")]
+      
+      for (t in 1:length(data$t_ind)){
+            ct_impact_post[c,,t]<-posterior[,paste0("ct_impact[",t,",",c,"]")]
+      }
+    }
+    
+
+#PLOTTING
+###############
+    YLIM<-range(ct_impact_real, ct_impact_post, y_real, y_post)
+    
+for (TYPE in c(T)){
+  
+  par(mfrow=c(C+2,1), mar = c(2, 4, 1, 15))
+  
+      # Control ct
+      #-----------------------
+  for (c in 1:C){
+        plot(x=data$t_ind, y = ct_impact_real[,c], type = "l", col=NA, lwd= 2,
+             xlab="",
+             ylab=paste0("Control ", c, "impact"), 
+             xlim=c(0, max(data$t_ind)),
+             ylim=if(TYPE==T){ylim=YLIM}else{ylim=range(ct_impact_real,ct_impact_post)}
+                    )
+      
+      for (sim in 1:nrow(posterior)){
+        lines(x=data$t_ind, y = ct_impact_post[c,sim,], type = "l", col=adjustcolor(colors[[c]][2]))
+      }
+          lines(x=data$t_ind, y = ct_impact_real[,c], type = "l", col=colors[[c]][1], lwd= 2)
+          abline(v=data$t_ind[year_marks], col="gray", lty=2)
+          abline(v=which(diff(data$is_test) == 1) + 1, col="firebrick", lty=1, lwd=2)
+        
+         legend("right",
+         inset = c(-0.4, 0),
+         legend = c("Real Value","Posterior Simulations", "Train-Test Split"),
+         col = c(colors[[c]][1], colors[[c]][2], "firebrick"), 
+         lwd = c(2, 4, 2),
+         lty=c(1,1),
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+  }
+
+}
+}
+```
+
+### B.5.5 KPI
+
+```{r}
+par(mfrow=c(3,1), mar = c(2, 4, 1, 15))
+
+# Y
+#-----------------------
+        plot(x=data$t_ind, y = y_real, type = "l", lwd= 2, col="NA",
+             xlab="",
+             xlim=c(0, max(data$t_ind)),
+             ylab="Y Signal",
+             ylim=if(TYPE==T){ylim=YLIM}else{ylim=range(y_real,y_post)}
+        )
+  abline(v=seq(48, length(data$t_ind), by=48), col="gray", lty=2)
+  
+  for (sim in 1:nrow(posterior)){
+        lines(x=data$t_ind, y = y_post[sim,], type = "l", col=adjustcolor("grey", alpha.f = 0.3))
+      }
+        lines(x=data$t_ind, y = y_real, type = "l", col="black", lwd= 2)
+        abline(v=which(diff(data$is_test) == 1) + 1, col="firebrick", lty=1, lwd=2)
+        
+         legend("right",
+         inset = c(-0.4, 0),
+         legend = c("Real Value","Posterior Simulations", "Train-Test Split"),
+         col = c("black", "grey", "firebrick"), 
+         lwd = c(2, 4, 2),
+         lty=c(1,1),
+         bty = "n",
+         xpd = NA,
+         cex = 1)
+```
+
+### B.4.6 Posterior ROI Histogram
+
+```{r}
+Cgglist_Applied<-list()
+
+ROI_params <-apply(expand.grid(c("ROI_x"), as.character(seq(1:M))), 1, function(x) paste0(x[1], "[", x[2], "]"))
+
+for (param in ROI_params){
+  param_corrected_name<-gsub("\\[|\\]", ".", param)
+  
+  g3<-mcmc_hist(posterior, pars=param) +
+    expand_limits(x = simulation.control[[param_corrected_name]][1])+
+    geom_vline(xintercept = simulation.control[[param_corrected_name]][1], color = "black", linetype = "dashed", lwd = 1)+
+    labs(title = param) +
+    theme(legend.position = "bottom",
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.title.y = element_blank(), 
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          plot.title = element_text(size = 10))
+  
+  Cgglist_Applied[[param]]<-g3 
+}
+
+wrap_plots(Cgglist_Applied) + plot_layout(nrow=M, guides = "collect")+plot_annotation("Posterior Histogram")
+```
+
+### B.4.6. Posterior Density All Parameters
+
+```{r message=FALSE}
+#Esta computación del plot debería poder optimizarse
+
+Cgglist_General<-list()
+
+for (param in params_General){
+  g1<-mcmc_hist(posterior, pars=param) + 
+    expand_limits(x = simulation.control[[param]][1])+
+    geom_vline(xintercept = simulation.control[[param]][1], color = "black", linetype = "dashed", lwd = 1)+
+    labs(title = param) +
+    theme(legend.position = "bottom",
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.title.y = element_blank(), 
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          plot.title = element_text(size = 10))
+  
+  Cgglist_General[[param]]<-g1 
+    
+}
+
+Cgglist_Seasonal<-list()
+
+for (param in params_Seasonal){
+  param_corrected_name<-gsub("\\[|\\]", ".", param)
+  
+  g2<-mcmc_hist(posterior, pars=param) +
+    expand_limits(x = simulation.control[[param_corrected_name]][1])+
+    geom_vline(xintercept = simulation.control[[param_corrected_name]][1], color = "black", linetype = "dashed", lwd = 1)+
+    labs(title = param) +
+    theme(legend.position = "bottom",
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.title.y = element_blank(), 
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          plot.title = element_text(size = 10))
+  
+  Cgglist_Seasonal[[param]]<-g2 
+    
+}
+
+Cgglist_X<-list()
+
+for (param in params_x){
+  param_corrected_name<-gsub("\\[|\\]", ".", param)
+  
+  g2<-mcmc_hist(posterior, pars=param) +
+    expand_limits(x = simulation.control[[param_corrected_name]][1])+
+    geom_vline(xintercept = simulation.control[[param_corrected_name]][1], color = "black", linetype = "dashed", lwd = 1)+
+    labs(title = param) +
+    theme(legend.position = "bottom",
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.title.y = element_blank(), 
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          plot.title = element_text(size = 10))
+  
+  Cgglist_X[[param]]<-g2 
+    
+}
+
+if(C>0){
+Cgglist_Control<-list()
+
+for (param in params_Control){
+  param_corrected_name<-gsub("\\[|\\]", ".", param)
+  
+  g2<-mcmc_hist(posterior, pars=param) +
+    expand_limits(x = simulation.control[[param_corrected_name]][1])+
+    geom_vline(xintercept = simulation.control[[param_corrected_name]][1], color = "black", linetype = "dashed", lwd = 1)+
+    labs(title = param) +
+    theme(legend.position = "bottom",
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.title.y = element_blank(), 
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          plot.title = element_text(size = 10))
+  
+  Cgglist_Control[[param]]<-g2 
+    
+}}
+
+Cgglist_Applied<-list()
+
+for (param in params_Applied){
+  param_corrected_name<-gsub("\\[|\\]", ".", param)
+  
+  g3<-mcmc_hist(posterior, pars=param,) +
+    expand_limits(x = simulation.control[[param_corrected_name]][1])+
+    geom_vline(xintercept = simulation.control[[param_corrected_name]][1], color = "black", linetype = "dashed", lwd = 1)+
+    labs(title = param) +
+    theme(legend.position = "bottom",
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.title.y = element_blank(), 
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          plot.title = element_text(size = 10))
+  
+  Cgglist_Applied[[param]]<-g3 
+    
+}
+
+Cgglist_Ratio<-list()
+
+for (param in params_Ratio){
+  g4<-mcmc_hist(posterior, pars=param,) +
+    expand_limits(x = simulation.control[[param]][1])+
+    geom_vline(xintercept = simulation.control[[param]][1], color = "black", linetype = "dashed", lwd = 1)+
+    labs(title = param) +
+    theme(legend.position = "bottom",
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.title.y = element_blank(), 
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          plot.title = element_text(size = 10))
+  
+  Cgglist_Ratio[[param]]<-g4
+    
+}
+```
+
+
+```{r message=FALSE}
+wrap_plots(Cgglist_General) + plot_layout(nrow=1, guides = "collect") +plot_annotation("Posterior Histogram")
+
+wrap_plots(Cgglist_Seasonal) + plot_layout(nrow=3, guides = "collect")+plot_annotation("Posterior Histogram")
+
+wrap_plots(Cgglist_X) + plot_layout(nrow=M, guides = "collect")+plot_annotation("Posterior Histogram")
+
+if(C>0){
+wrap_plots(Cgglist_Control) + plot_layout(nrow=C, guides = "collect")+plot_annotation("Posterior Histogram")
+}
+
+wrap_plots(Cgglist_Applied) + plot_layout(nrow=M, guides = "collect")+plot_annotation("Posterior Histogram")
+
+wrap_plots(Cgglist_Ratio) + plot_layout(nrow=1, guides = "collect") +plot_annotation("Posterior Histogram")
+```
